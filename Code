@@ -1,0 +1,536 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+#include <esp_system.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ---------------------------- CONFIG ----------------------------
+
+#define DEVICE_ID "3f54c9c7-1b3f-4bce-a302-a3a2e104f52a"
+
+// WIFI
+#define WIFI_SSID "JEETHAN"
+#define WIFI_PASS "JEETHAN1011"
+
+// MQTT (HiveMQ)
+#define MQTT_SERVER "dd93afac460a4ce0a3dfdbcc282c4e04.s1.eu.hivemq.cloud"
+#define MQTT_PORT 8883           // 1883 if no TLS
+#define MQTT_USER "jeethan"
+#define MQTT_PASS "Amjj.1011"
+#define MQTT_USE_TLS true
+
+// Telemetry interval
+const unsigned long TELEMETRY_INTERVAL_MS = 5000; // 5s
+
+// Pump schedule: once every 6 hours, ON for 1 minute
+const unsigned long PUMP_INTERVAL_MS    = 6UL * 60UL * 60UL * 1000UL; // 6 hours
+const unsigned long PUMP_ON_DURATION_MS = 1UL * 60UL * 1000UL;        // 1 minute
+
+// -------------------------- PIN CONFIG --------------------------
+
+// MQ135 (analog)
+const uint8_t PIN_MQ135_A0 = 34;
+
+// DHT22
+const uint8_t PIN_DHT = 4;
+
+// Water level (ANALOG)
+const uint8_t PIN_WATER_A0 = 35;  // AO of water level sensor
+
+// LDR (ANALOG for brightness)
+const uint8_t PIN_LDR_A0 = 33;    // AO of LDR sensor
+
+// Relays (active LOW)
+const uint8_t PIN_RELAY_FAN   = 5;
+const uint8_t PIN_RELAY_LIGHT = 18;
+const uint8_t PIN_RELAY_PUMP  = 19;
+
+// Switches (active LOW, with INPUT_PULLUP)
+const uint8_t PIN_SWITCH_FAN   = 14; // 1st switch -> FAN
+const uint8_t PIN_SWITCH_LIGHT = 27; // 2nd switch -> LIGHT
+const uint8_t PIN_SWITCH_PUMP  = 26; // 3rd switch -> PUMP
+
+// LCD (I2C) 20x4
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ---------------------- GLOBAL STATE ----------------------------
+
+#define DHTTYPE DHT22
+DHT dht(PIN_DHT, DHTTYPE);
+
+WiFiClientSecure secureClient;
+WiFiClient insecureClient;
+PubSubClient *mqttClientPtr = nullptr;
+
+const int MQ_READINGS = 8;
+int mqBuffer[MQ_READINGS];
+uint8_t mqIndex = 0;
+long mqSum = 0;
+
+bool estopLatched      = false;   // only via MQTT
+unsigned long lastTelemetryMillis = 0;
+
+// Pump scheduler state
+unsigned long pumpStartMillis = 0;
+bool pumpOn = false;
+
+// -------------------------- HELPERS -----------------------------
+
+String topicTelemetry() { return String("mushroom/") + DEVICE_ID + "/telemetry"; }
+String topicControl()   { return String("mushroom/") + DEVICE_ID + "/control"; }
+String topicStatus()    { return String("mushroom/") + DEVICE_ID + "/status"; }
+
+// simple MQ135 averaging
+int readMQ135Raw() {
+  int raw = analogRead(PIN_MQ135_A0);
+  mqSum -= mqBuffer[mqIndex];
+  mqBuffer[mqIndex] = raw;
+  mqSum += mqBuffer[mqIndex];
+  mqIndex = (mqIndex + 1) % MQ_READINGS;
+  return mqSum / MQ_READINGS;
+}
+
+// rough mapping, just trend, not calibrated
+int estimateCO2ppm(int raw) {
+  int ppm = map(raw, 400, 2500, 400, 2000);
+  if (ppm < 300)  ppm = 300;
+  if (ppm > 5000) ppm = 5000;
+  return ppm;
+}
+
+// Read water level as percentage (0–100%) based on raw 0–4095
+int readWaterPercent() {
+  int raw = analogRead(PIN_WATER_A0);   // 0–4095
+  int pct = (raw * 100) / 4095;         // integer percentage
+  if (pct < 0)   pct = 0;
+  if (pct > 100) pct = 100;
+  return pct;
+}
+
+// Read light brightness as percentage (0–100%)
+int readBrightnessPercent() {
+  int raw = analogRead(PIN_LDR_A0);        // 0–4095
+  int pct = map(raw, 0, 4095, 0, 100);
+  if (pct < 0)   pct = 0;
+  if (pct > 100) pct = 100;
+  return pct;
+}
+
+// Brightness label for Serial/MQTT
+const char* brightnessLabelWord(int pct) {
+  if (pct < 30)      return "BRIGHT";
+  else if (pct < 70) return "MEDIUM";
+  else               return "DARK";
+}
+
+// simple "pressed when LOW"
+bool isButtonPressed(uint8_t pin) {
+  return digitalRead(pin) == LOW;
+}
+
+// Clear one LCD line (0..3)
+void lcdClearLine(uint8_t row) {
+  lcd.setCursor(0, row);
+  lcd.print("                    "); // 20 spaces
+}
+
+// Forward-declare LCD updater
+void updateStatusLineOnLcd();
+
+// -------------------- MQTT TELEMETRY ----------------------------
+
+void publishTelemetry(float temp, float hum, int co2, int mq_raw,
+                      int brightness_pct, int water_pct) {
+  StaticJsonDocument<384> doc;
+
+  if (!isnan(temp)) doc["temp"] = temp;
+  if (!isnan(hum))  doc["humidity"] = hum;
+  doc["co2"]         = co2;
+  doc["co2_raw"]     = mq_raw;
+
+  doc["water_level"]      = water_pct;      // 0–100 %
+  doc["brightness"]       = brightness_pct; // 0–100 %
+  doc["brightness_label"] = brightnessLabelWord(brightness_pct);
+
+  // Relay states as booleans
+  JsonObject rel = doc.createNestedObject("relays");
+  rel["fan"]   = (digitalRead(PIN_RELAY_FAN)   == LOW);
+  rel["light"] = (digitalRead(PIN_RELAY_LIGHT) == LOW);
+  rel["pump"]  = (digitalRead(PIN_RELAY_PUMP)  == LOW);
+
+  doc["mode"]  = "MANUAL";
+  doc["estop"] = estopLatched;  // boolean
+
+  char buf[512];
+  size_t n = serializeJson(doc, buf);
+  buf[n] = 0;
+
+  if (mqttClientPtr && mqttClientPtr->connected()) {
+    mqttClientPtr->publish(topicTelemetry().c_str(), buf, n);
+    Serial.printf("Published telemetry -> %s\n", buf);
+  } else {
+    Serial.println("MQTT not connected: can't publish telemetry");
+  }
+}
+
+// -------------------- MQTT CONTROL HANDLING ---------------------
+
+void handleControlMessage(const char* payload, unsigned int length) {
+  DynamicJsonDocument jd(512);
+  auto err = deserializeJson(jd, payload, length);
+  if (err) {
+    Serial.println("Control: invalid JSON");
+    return;
+  }
+
+  long cmd_id = 0;
+  if (jd.containsKey("cmd_id")) cmd_id = jd["cmd_id"].as<long>();
+
+  const char* command = jd["command"] | "";
+  if (strcmp(command, "set_relay") == 0) {
+
+    const char* device = jd["device"] | "";
+    int state = jd["state"] | 0;
+
+    if      (strcmp(device, "fan")   == 0) digitalWrite(PIN_RELAY_FAN,   state ? LOW : HIGH);
+    else if (strcmp(device, "light") == 0) digitalWrite(PIN_RELAY_LIGHT, state ? LOW : HIGH);
+    else if (strcmp(device, "pump")  == 0) digitalWrite(PIN_RELAY_PUMP,  state ? LOW : HIGH);
+
+    DynamicJsonDocument ack(256);
+    ack["cmd_id"] = cmd_id;
+    ack["status"] = "ack";
+    char b[256]; size_t nn = serializeJson(ack, b);
+    mqttClientPtr->publish(topicStatus().c_str(), b, nn);
+    Serial.printf("Control: set_relay %s -> %d\n", device, state);
+
+  } else if (strcmp(command, "set_mode") == 0) {
+
+    DynamicJsonDocument ack(256);
+    ack["cmd_id"] = cmd_id;
+    ack["status"] = "ack";
+    ack["mode"]   = "MANUAL"; // fixed
+    char b[256]; size_t nn = serializeJson(ack, b);
+    mqttClientPtr->publish(topicStatus().c_str(), b, nn);
+    Serial.println("Control: set_mode ignored (always MANUAL)");
+
+  } else if (strcmp(command, "emergency_stop") == 0) {
+
+    bool activate = jd["state"] | false;
+    if (activate) {
+      estopLatched = true;
+      digitalWrite(PIN_RELAY_FAN,   HIGH);
+      digitalWrite(PIN_RELAY_LIGHT, HIGH);
+      digitalWrite(PIN_RELAY_PUMP,  HIGH);
+      pumpOn = false; // cancel scheduled pump run
+    } else {
+      estopLatched = false;
+    }
+
+    DynamicJsonDocument ack(256);
+    ack["cmd_id"] = cmd_id;
+    ack["status"] = "ack";
+    ack["estop"]  = estopLatched;
+    char b[256]; size_t nn = serializeJson(ack, b);
+    mqttClientPtr->publish(topicStatus().c_str(), b, nn);
+    Serial.printf("Control: estop -> %d\n", estopLatched ? 1 : 0);
+
+  } else {
+    Serial.println("Control: unknown command");
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  if (t == topicControl()) {
+    handleControlMessage((const char*)payload, length);
+  } else {
+    Serial.printf("MQTT message on %s (ignored)\n", topic);
+  }
+}
+
+// ---------------------- WIFI & MQTT SETUP -----------------------
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+    if (retry > 60) {
+      Serial.println("\nWiFi failed - rebooting");
+      delay(3000);
+      ESP.restart();
+    }
+  }
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void ensureMqttConnected() {
+  if (!mqttClientPtr) return;
+  if (mqttClientPtr->connected()) return;
+
+  Serial.println("Connecting to MQTT broker...");
+  while (!mqttClientPtr->connected()) {
+    uint64_t chipid = ESP.getEfuseMac();
+    uint32_t shortId = (uint32_t)(chipid & 0xFFFFFF);
+    String clientId = String("mushroom-esp32-") + String(shortId, HEX);
+
+    bool ok = mqttClientPtr->connect(clientId.c_str(), MQTT_USER, MQTT_PASS);
+    if (ok) {
+      Serial.println("MQTT connected");
+      mqttClientPtr->subscribe(topicControl().c_str(), 1);
+      mqttClientPtr->subscribe(topicStatus().c_str(), 1);
+    } else {
+      Serial.printf("MQTT connect failed rc=%d. retry 2s\n", mqttClientPtr->state());
+      delay(2000);
+    }
+  }
+}
+
+// ------------------------- PIN SETUP ----------------------------
+
+void setupPins() {
+  // Relays OFF (active LOW)
+  pinMode(PIN_RELAY_FAN,   OUTPUT); digitalWrite(PIN_RELAY_FAN,   HIGH);
+  pinMode(PIN_RELAY_LIGHT, OUTPUT); digitalWrite(PIN_RELAY_LIGHT, HIGH);
+  pinMode(PIN_RELAY_PUMP,  OUTPUT); digitalWrite(PIN_RELAY_PUMP,  HIGH);
+
+  // Switches (internal pull-up)
+  pinMode(PIN_SWITCH_FAN,   INPUT_PULLUP);
+  pinMode(PIN_SWITCH_LIGHT, INPUT_PULLUP);
+  pinMode(PIN_SWITCH_PUMP,  INPUT_PULLUP);
+
+  // MQ135 buffer init
+  for (int i = 0; i < MQ_READINGS; ++i) mqBuffer[i] = analogRead(PIN_MQ135_A0);
+  mqSum = 0;
+  for (int i = 0; i < MQ_READINGS; ++i) mqSum += mqBuffer[i];
+  mqIndex = 0;
+}
+
+// ------------------- LCD STATUS LINE UPDATE ---------------------
+// line 3: FAN & LIGHT
+// line 4: PUMP
+void updateStatusLineOnLcd() {
+  // Line 3: FAN & LIGHT
+  lcdClearLine(2);
+  lcd.setCursor(0, 2);
+  lcd.print("FAN:");
+  lcd.print((digitalRead(PIN_RELAY_FAN) == LOW) ? "ON " : "OFF");
+  lcd.print("  LIGHT:");
+  lcd.print((digitalRead(PIN_RELAY_LIGHT) == LOW) ? "ON " : "OFF");
+
+  // Line 4: PUMP
+  lcdClearLine(3);
+  lcd.setCursor(0, 3);
+  lcd.print("PUMP:");
+  lcd.print((digitalRead(PIN_RELAY_PUMP) == LOW) ? "ON" : "OFF");
+}
+
+// --------------------------- SETUP ------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\nMushroom Chamber ESP32 (FINAL) starting...");
+
+  setupPins();
+  dht.begin();
+
+  // Pump schedule: start counting from now (first run after 6 hours)
+  pumpStartMillis = millis();
+  pumpOn = false;
+
+  // LCD
+  Wire.begin();   // SDA=21, SCL=22 default
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Mushroom Chamber");
+  lcd.setCursor(0, 1);
+  lcd.print("Booting...");
+  delay(1500);
+  lcd.clear();
+  updateStatusLineOnLcd();
+
+  connectWiFi();
+
+  if (MQTT_USE_TLS) {
+    secureClient.setInsecure();
+    mqttClientPtr = new PubSubClient(secureClient);
+  } else {
+    mqttClientPtr = new PubSubClient(insecureClient);
+  }
+  mqttClientPtr->setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClientPtr->setCallback(mqttCallback);
+
+  ensureMqttConnected();
+}
+
+// ---------------------------- LOOP ------------------------------
+
+void loop() {
+  if (mqttClientPtr) mqttClientPtr->loop();
+  if (mqttClientPtr && !mqttClientPtr->connected()) ensureMqttConnected();
+
+  unsigned long now = millis();
+
+  // ------ PUMP SCHEDULER ------
+  if (!estopLatched) {
+    if (!pumpOn && (now - pumpStartMillis >= PUMP_INTERVAL_MS)) {
+      pumpOn = true;
+      pumpStartMillis = now;
+      digitalWrite(PIN_RELAY_PUMP, LOW);  // ON
+      Serial.println("PUMP: ON (scheduled)");
+      updateStatusLineOnLcd();
+    } else if (pumpOn && (now - pumpStartMillis >= PUMP_ON_DURATION_MS)) {
+      pumpOn = false;
+      digitalWrite(PIN_RELAY_PUMP, HIGH); // OFF
+      Serial.println("PUMP: OFF (after duration)");
+      pumpStartMillis = now;
+      updateStatusLineOnLcd();
+    }
+  } else {
+    if (pumpOn) {
+      Serial.println("PUMP: forced OFF due to estop");
+    }
+    pumpOn = false;
+    digitalWrite(PIN_RELAY_PUMP, HIGH);
+    updateStatusLineOnLcd();
+  }
+
+  // ------ SWITCH LOGIC: individual toggle buttons ------
+  bool fanPressedNow   = isButtonPressed(PIN_SWITCH_FAN);
+  bool lightPressedNow = isButtonPressed(PIN_SWITCH_LIGHT);
+  bool pumpPressedNow  = isButtonPressed(PIN_SWITCH_PUMP);
+
+  static bool lastFanPressed   = false;
+  static bool lastLightPressed = false;
+  static bool lastPumpPressed  = false;
+
+  // Debug once per second
+  static unsigned long lastBtnDebug = 0;
+  if (now - lastBtnDebug > 1000) {
+    lastBtnDebug = now;
+    Serial.printf("[Button] FAN: %s, LIGHT: %s, PUMP: %s\n",
+                  fanPressedNow   ? "PRESSED" : "released",
+                  lightPressedNow ? "PRESSED" : "released",
+                  pumpPressedNow  ? "PRESSED" : "released");
+  }
+
+  // FAN button toggle
+  if (fanPressedNow && !lastFanPressed && !estopLatched) {
+    bool fanOn = (digitalRead(PIN_RELAY_FAN) == LOW);
+    bool newFanOn = !fanOn;
+    digitalWrite(PIN_RELAY_FAN, newFanOn ? LOW : HIGH);
+    Serial.printf("FAN button pressed -> FAN %s\n", newFanOn ? "ON" : "OFF");
+    updateStatusLineOnLcd();
+  }
+  lastFanPressed = fanPressedNow;
+
+  // LIGHT button toggle
+  if (lightPressedNow && !lastLightPressed && !estopLatched) {
+    bool lightOn = (digitalRead(PIN_RELAY_LIGHT) == LOW);
+    bool newLightOn = !lightOn;
+    digitalWrite(PIN_RELAY_LIGHT, newLightOn ? LOW : HIGH);
+    Serial.printf("LIGHT button pressed -> LIGHT %s\n", newLightOn ? "ON" : "OFF");
+    updateStatusLineOnLcd();
+  }
+  lastLightPressed = lightPressedNow;
+
+  // PUMP button toggle (manual)
+  if (pumpPressedNow && !lastPumpPressed && !estopLatched) {
+    bool pumpRelayOn = (digitalRead(PIN_RELAY_PUMP) == LOW);
+    bool newPumpOn = !pumpRelayOn;
+    digitalWrite(PIN_RELAY_PUMP, newPumpOn ? LOW : HIGH);
+    Serial.printf("PUMP button pressed -> PUMP %s (manual)\n",
+                  newPumpOn ? "ON" : "OFF");
+    updateStatusLineOnLcd();
+  }
+  lastPumpPressed = pumpPressedNow;
+
+  // -------- TELEMETRY, LCD, SERIAL --------
+  if (now - lastTelemetryMillis >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryMillis = now;
+
+    float temp    = dht.readTemperature();
+    float hum     = dht.readHumidity();
+    int   mq_raw  = readMQ135Raw();
+    int   co2_ppm = estimateCO2ppm(mq_raw);
+
+    int   water_pct      = readWaterPercent();
+    int   brightness_pct = readBrightnessPercent();
+
+    bool dhtOk = !(isnan(temp) || isnan(hum) || (temp == 0.0 && hum == 0.0));
+
+    // ---------- LCD (lines 1 & 2) ----------
+    // Line 1: Temperature & Humidity
+    lcdClearLine(0);
+    lcd.setCursor(0, 0);
+    if (dhtOk) {
+      lcd.print("T:");
+      lcd.print(temp, 1);
+      lcd.print("C  H:");
+      lcd.print(hum, 1);
+      lcd.print("%");
+    } else {
+      lcd.print("T:---C  H:---%");
+    }
+
+    // Line 2: CO2 & Brightness
+    lcdClearLine(1);
+    lcd.setCursor(0, 1);
+    lcd.print("CO2:");
+    lcd.print(co2_ppm);
+    lcd.print("ppm  B:");
+    lcd.print(brightness_pct);
+    lcd.print("%");
+
+    // Lines 3 & 4: relay status
+    updateStatusLineOnLcd();
+
+    // ---------- SERIAL STATUS ----------
+    Serial.println("===== Mushroom Chamber Status =====");
+    if (dhtOk) {
+      Serial.printf("Temperature: %.1f C\n", temp);
+      Serial.printf("Humidity: %.1f %%\n", hum);
+    } else {
+      Serial.println("Temperature: --- (DHT error)");
+      Serial.println("Humidity: --- (DHT error)");
+      temp = NAN;
+      hum  = NAN;
+    }
+
+    Serial.printf("CO2 (ppm): %d | MQ135 Raw: %d\n", co2_ppm, mq_raw);
+    Serial.printf("Water Level: %d %%\n", water_pct);
+    Serial.printf("Brightness: %d %% (%s)\n",
+                  brightness_pct, brightnessLabelWord(brightness_pct));
+
+    Serial.print("Fan Relay:   ");
+    Serial.println((digitalRead(PIN_RELAY_FAN) == LOW) ? "ON" : "OFF");
+
+    Serial.print("Light Relay: ");
+    Serial.println((digitalRead(PIN_RELAY_LIGHT) == LOW) ? "ON" : "OFF");
+
+    Serial.print("Pump Relay:  ");
+    Serial.println((digitalRead(PIN_RELAY_PUMP) == LOW) ? "ON" : "OFF");
+
+    Serial.print("Estop Latched (MQTT): ");
+    Serial.println(estopLatched ? "YES" : "NO");
+
+    Serial.println("====================================\n");
+
+    // ---------- MQTT ----------
+    publishTelemetry(temp, hum, co2_ppm, mq_raw, brightness_pct, water_pct);
+  }
+
+  delay(10);
